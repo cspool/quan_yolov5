@@ -56,12 +56,15 @@ def generate_instr_args_init(args_file,args_hex_num_file,mode,k,s,p,of,ox,oy,ix,
   output_ddr_layer_base_adr_integer = 0
   ix_index_num_real = math.ceil(ix_integer / pixels_in_row_real)
   iy_index_num_real = math.ceil(iy_integer)
-  tilex_first_ix_word_num_real = math.ceil(((pixels_in_row - 1) * s_real + k_real - p_real) / pixels_in_row)
-  # tilex mid rectified
+  tilex_first_ix_word_num_real = math.ceil(((pixels_in_row - 1) * s_real + k_real - p_real) / pixels_in_row) \
+  if (ix_index_num_real >= math.ceil(((pixels_in_row - 1) * s_real + k_real - p_real) / pixels_in_row)) \
+  else ix_index_num_real ## the rest of idx need right pad 
   tilex_last_ix_word_num_real = s_real if (((ix_index_num_real - tilex_first_ix_word_num_real) % s_real) == 0) \
   else ((ix_index_num_real - tilex_first_ix_word_num_real) % s_real)
   tilex_mid_ix_word_num_real = s_real
-  tiley_first_iy_row_num_real = (buffers_num - 1) * s_real + k_real - p_real
+  tiley_first_iy_row_num_real = (buffers_num - 1) * s_real + k_real - p_real \
+  if (iy_index_num_real >= (buffers_num - 1) * s_real + k_real - p_real) \
+  else iy_index_num_real
   # tiley mid rectified
   tiley_last_iy_row_num_real = (buffers_num * s_real) if ((iy_index_num_real - tiley_first_iy_row_num_real) % (buffers_num * s_real) == 0) \
   else ((iy_index_num_real - tiley_first_iy_row_num_real) % (buffers_num * s_real))
@@ -254,7 +257,7 @@ def trans_conv_input_data(input_tensor_file, ori_input, nif, iy, ix):
   # reshape input tensor into ddr words
   activation_x_num_in_ddr_word = 32
   activation_in_channel_num_in_ddr_word = 2 # ddr_word_width / activation_x_num_in_ddr_word / weight_word_width
-  assert ix % 32 == 0
+  assert ix % 32 == 0 or ix < 32
   # reshape input data
   # (C, H, W) ---> (H, W/32, C/2, 32*2); input ddr words in tensor format
   input_tensor = input_data.view(math.ceil(nif / 2), 2, iy, ix // 32, 32)\
@@ -498,3 +501,64 @@ def save_yolo_CBR(output_file, output_tensor):
                   for value in output_tensor[i, j, k, :]:  # 遍历宽度维度
                       f.write(f"{int(value.item()):3d} ")  # 写入整数值
                   f.write("\n")  # 每一行结束后换行
+
+
+def collect_FPGA_result(of, oy, ox):
+    # collect the result from txt file
+    fpga_output_tensors = torch.zeros(size=(1, of, oy, ox), dtype=torch.int8)
+    with open("conv_result.txt", "r") as f:
+        next(f)  # 跳过第一行表头
+        for line in f:
+            if line is None: continue
+            # 解析每一行的数据
+            line_spilt = line.strip().split()
+            if len(line_spilt) < 6: continue
+            time, valid, out_f_idx, out_y_idx, out_x_idx, result_word = line_spilt
+            if len(result_word) < 64: continue
+            if valid != "1": continue
+            out_f_idx, out_y_idx, out_x_idx = int(out_f_idx), int(out_y_idx), int(out_x_idx)
+            
+            # 将64位16进制数转换为32个2位16进制数，并进一步转换为10进制数
+            hex_values = [result_word[i:i+2] for i in range(0, len(result_word), 2)]
+            decimal_values = [int(value, 16) for value in hex_values]
+            
+            # 计算写入张量的起始和结束索引
+            start_idx = (out_f_idx - 1, out_y_idx - 1, (out_x_idx - 1))
+            end_idx = (out_f_idx - 1, out_y_idx -1 , out_x_idx - 1 + 32)
+            
+            # 将数据写入张量，编号小的数写入坐标大的位置
+            fpga_output_tensors[0, start_idx[0], start_idx[1], start_idx[2]:end_idx[2]] = torch.tensor(decimal_values[::-1], dtype=torch.uint8)
+
+    fpga_output_tensors = fpga_output_tensors.to(dtype=torch.uint8)
+    with open("fpga_output_tensors.txt", "w") as f:
+        # 写入张量的维度信息
+        f.write(" ".join(map(str, fpga_output_tensors.shape)) + "\n")
+        
+        # 遍历张量的每个元素并写入文件
+        for b in range(fpga_output_tensors.size(0)):  # 遍历第0个维度
+          for i in range(fpga_output_tensors.size(1)):  # 遍历第一个维度
+              for j in range(fpga_output_tensors.size(2)):  # 遍历第二个维度
+                  f.write(f"channel {i:4d} - height {j:4d} : ")
+                  for k in range(fpga_output_tensors.size(3)):  # 遍历第三个维度
+                      f.write(f"{fpga_output_tensors[b, i, j, k].item():3d} ")
+                  f.write("\n")  # 每一行结束后换行
+
+def compare_files(file1_path, file2_path):
+    with open(file1_path, 'r', encoding='utf-8') as file1, \
+         open(file2_path, 'r', encoding='utf-8') as file2:
+        lines1 = file1.readlines()
+        lines2 = file2.readlines()
+
+    if len(lines1) != len(lines2):
+        print("两个文件的行数不同。")
+        return False
+
+    for i, (line1, line2) in enumerate(zip(lines1, lines2), start=1):
+        if line1 != line2:
+            print(f"第 {i} 行不同：")
+            print(f"文件1: {line1.strip()}")
+            print(f"文件2: {line2.strip()}")
+            return False
+
+    print("两个文件完全相同。")
+    return True
